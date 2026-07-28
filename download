@@ -1,0 +1,568 @@
+import base64
+import hashlib
+import hmac
+import os
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+import models
+import schemas
+from database import Base, engine, get_db
+
+Base.metadata.create_all(bind=engine)
+
+# Add the petition title column for databases created before titles were added.
+# create_all() creates new tables but does not modify an existing table.
+with engine.begin() as connection:
+    connection.execute(
+        text(
+            "ALTER TABLE petitions "
+            "ADD COLUMN IF NOT EXISTS title VARCHAR(200)"
+        )
+    )
+    connection.execute(
+        text(
+            "UPDATE petitions "
+            "SET title = 'Untitled Petition' "
+            "WHERE title IS NULL OR title = ''"
+        )
+    )
+
+app = FastAPI(title="YouthLink API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    derived_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000,
+    )
+    return f"{base64.b64encode(salt).decode()}:{base64.b64encode(derived_key).decode()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt_text, key_text = stored_hash.split(":", 1)
+        salt = base64.b64decode(salt_text)
+        expected_key = base64.b64decode(key_text)
+    except (ValueError, TypeError):
+        return False
+
+    actual_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000,
+    )
+    return hmac.compare_digest(actual_key, expected_key)
+
+
+@app.get("/")
+def home():
+    return {"message": "Teen Chat API is running"}
+
+
+# -------------------------
+# Users
+# -------------------------
+@app.post("/signup", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
+def signup(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    new_user = models.User(
+        username=user.username.strip(),
+        email=str(user.email).lower(),
+        password_hash=hash_password(user.password),
+        student_id=user.student_id.strip() if user.student_id else None,
+    )
+
+    db.add(new_user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Username, email, or student ID already exists.",
+        )
+
+    db.refresh(new_user)
+    return new_user
+
+
+@app.post("/login")
+def login(credentials: schemas.UserLogin, db: Session = Depends(get_db)):
+    user = db.scalar(
+        select(models.User).where(models.User.username == credentials.username.strip())
+    )
+
+    if user is None or not verify_password(credentials.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    return {
+        "message": "Login successful",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "student_id": user.student_id,
+        },
+    }
+
+
+# -------------------------
+# Petitions
+# -------------------------
+@app.get("/petitions", response_model=list[schemas.PetitionResponse])
+def get_petitions(db: Session = Depends(get_db)):
+    return db.scalars(
+        select(models.Petition).order_by(models.Petition.created_at.desc())
+    ).all()
+
+
+@app.post("/petitions", response_model=schemas.PetitionResponse, status_code=201)
+def create_petition(petition: schemas.PetitionCreate, db: Session = Depends(get_db)):
+    new_petition = models.Petition(
+        username=petition.username.strip(),
+        title=petition.title.strip(),
+        text=petition.text.strip(),
+    )
+    db.add(new_petition)
+    db.commit()
+    db.refresh(new_petition)
+    return new_petition
+
+
+@app.put("/petitions/{petition_id}", response_model=schemas.PetitionResponse)
+def update_petition(
+    petition_id: int,
+    petition: schemas.PetitionUpdate,
+    db: Session = Depends(get_db),
+):
+    saved_petition = db.get(models.Petition, petition_id)
+    if saved_petition is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    if petition.title is not None:
+        saved_petition.title = petition.title.strip()
+    if petition.text is not None:
+        saved_petition.text = petition.text.strip()
+
+    db.commit()
+    db.refresh(saved_petition)
+    return saved_petition
+
+
+@app.delete("/petitions/{petition_id}")
+def delete_petition(petition_id: int, db: Session = Depends(get_db)):
+    petition = db.get(models.Petition, petition_id)
+    if petition is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    db.delete(petition)
+    db.commit()
+    return {"message": "Petition deleted"}
+
+
+@app.get(
+    "/petitions/{petition_id}/comments",
+    response_model=list[schemas.CommentResponse],
+)
+def get_petition_comments(petition_id: int, db: Session = Depends(get_db)):
+    if db.get(models.Petition, petition_id) is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    return db.scalars(
+        select(models.PetitionComment)
+        .where(models.PetitionComment.petition_id == petition_id)
+        .order_by(models.PetitionComment.created_at.asc())
+    ).all()
+
+
+@app.post(
+    "/petitions/{petition_id}/comments",
+    response_model=schemas.CommentResponse,
+    status_code=201,
+)
+def create_petition_comment(
+    petition_id: int,
+    comment: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Petition, petition_id) is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    new_comment = models.PetitionComment(
+        petition_id=petition_id,
+        username=comment.username.strip(),
+        comment=comment.comment.strip(),
+    )
+    db.add(new_comment)
+    db.commit()
+    db.refresh(new_comment)
+    return new_comment
+
+
+@app.get(
+    "/petitions/{petition_id}/status",
+    response_model=schemas.PetitionStatusResponse,
+)
+def get_petition_status(
+    petition_id: int,
+    username: str | None = None,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Petition, petition_id) is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    thumbs_up = db.scalar(
+        select(func.count(models.PetitionVote.id)).where(
+            models.PetitionVote.petition_id == petition_id,
+            models.PetitionVote.value == 1,
+        )
+    ) or 0
+    thumbs_down = db.scalar(
+        select(func.count(models.PetitionVote.id)).where(
+            models.PetitionVote.petition_id == petition_id,
+            models.PetitionVote.value == -1,
+        )
+    ) or 0
+    signature_count = db.scalar(
+        select(func.count(models.PetitionSignature.id)).where(
+            models.PetitionSignature.petition_id == petition_id
+        )
+    ) or 0
+
+    user_vote = None
+    user_signed = False
+    if username:
+        clean_username = username.strip()
+        vote = db.scalar(
+            select(models.PetitionVote).where(
+                models.PetitionVote.petition_id == petition_id,
+                models.PetitionVote.username == clean_username,
+            )
+        )
+        user_vote = vote.value if vote else None
+        user_signed = db.scalar(
+            select(models.PetitionSignature.id).where(
+                models.PetitionSignature.petition_id == petition_id,
+                models.PetitionSignature.username == clean_username,
+            )
+        ) is not None
+
+    return {
+        "petition_id": petition_id,
+        "thumbs_up": thumbs_up,
+        "thumbs_down": thumbs_down,
+        "signature_count": signature_count,
+        "user_vote": user_vote,
+        "user_signed": user_signed,
+    }
+
+
+@app.put("/petitions/{petition_id}/vote")
+def vote_on_petition(
+    petition_id: int,
+    vote_data: schemas.PetitionVoteCreate,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Petition, petition_id) is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    if vote_data.value not in (-1, 1):
+        raise HTTPException(status_code=422, detail="Vote must be 1 or -1.")
+
+    username = vote_data.username.strip()
+    vote = db.scalar(
+        select(models.PetitionVote).where(
+            models.PetitionVote.petition_id == petition_id,
+            models.PetitionVote.username == username,
+        )
+    )
+
+    if vote is None:
+        vote = models.PetitionVote(
+            petition_id=petition_id,
+            username=username,
+            value=vote_data.value,
+        )
+        db.add(vote)
+    elif vote.value == vote_data.value:
+        # Pressing the same reaction again removes it.
+        db.delete(vote)
+    else:
+        # Switching from up to down (or down to up) updates the same row.
+        vote.value = vote_data.value
+
+    db.commit()
+    return {"message": "Petition feedback updated."}
+
+
+@app.post("/petitions/{petition_id}/signatures", status_code=201)
+def sign_petition(
+    petition_id: int,
+    signature_data: schemas.PetitionSignatureCreate,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Petition, petition_id) is None:
+        raise HTTPException(status_code=404, detail="Petition not found.")
+
+    username = signature_data.username.strip()
+    existing = db.scalar(
+        select(models.PetitionSignature).where(
+            models.PetitionSignature.petition_id == petition_id,
+            models.PetitionSignature.username == username,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="You already signed this petition.")
+
+    signature = models.PetitionSignature(
+        petition_id=petition_id,
+        username=username,
+    )
+    db.add(signature)
+    db.commit()
+    return {"message": "Petition signed."}
+
+
+@app.delete("/petitions/{petition_id}/signatures/{username}")
+def withdraw_petition_signature(
+    petition_id: int,
+    username: str,
+    db: Session = Depends(get_db),
+):
+    signature = db.scalar(
+        select(models.PetitionSignature).where(
+            models.PetitionSignature.petition_id == petition_id,
+            models.PetitionSignature.username == username.strip(),
+        )
+    )
+    if signature is None:
+        raise HTTPException(status_code=404, detail="You have not signed this petition.")
+
+    db.delete(signature)
+    db.commit()
+    return {"message": "Signature withdrawn."}
+
+
+# -------------------------
+# Discussion threads
+# -------------------------
+@app.get("/threads", response_model=list[schemas.ThreadResponse])
+def get_threads(db: Session = Depends(get_db)):
+    return db.scalars(
+        select(models.DiscussionThread).order_by(
+            models.DiscussionThread.created_at.desc()
+        )
+    ).all()
+
+
+@app.post("/threads", response_model=schemas.ThreadResponse, status_code=201)
+def create_thread(thread: schemas.ThreadCreate, db: Session = Depends(get_db)):
+    new_thread = models.DiscussionThread(
+        username=thread.username.strip(),
+        title=thread.title.strip(),
+        text=thread.text.strip(),
+    )
+    db.add(new_thread)
+    db.commit()
+    db.refresh(new_thread)
+    return new_thread
+
+
+@app.put("/threads/{thread_id}", response_model=schemas.ThreadResponse)
+def update_thread(
+    thread_id: int,
+    changes: schemas.ThreadUpdate,
+    db: Session = Depends(get_db),
+):
+    thread = db.get(models.DiscussionThread, thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Discussion thread not found.")
+
+    if changes.title is not None:
+        thread.title = changes.title.strip()
+    if changes.text is not None:
+        thread.text = changes.text.strip()
+
+    db.commit()
+    db.refresh(thread)
+    return thread
+
+
+@app.delete("/threads/{thread_id}")
+def delete_thread(thread_id: int, db: Session = Depends(get_db)):
+    thread = db.get(models.DiscussionThread, thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Discussion thread not found.")
+
+    db.delete(thread)
+    db.commit()
+    return {"message": "Discussion thread deleted"}
+
+
+@app.get(
+    "/threads/{thread_id}/comments",
+    response_model=list[schemas.CommentResponse],
+)
+def get_thread_comments(thread_id: int, db: Session = Depends(get_db)):
+    if db.get(models.DiscussionThread, thread_id) is None:
+        raise HTTPException(status_code=404, detail="Discussion thread not found.")
+
+    return db.scalars(
+        select(models.ThreadComment)
+        .where(models.ThreadComment.thread_id == thread_id)
+        .order_by(models.ThreadComment.created_at.asc())
+    ).all()
+
+
+@app.post(
+    "/threads/{thread_id}/comments",
+    response_model=schemas.CommentResponse,
+    status_code=201,
+)
+def create_thread_comment(
+    thread_id: int,
+    comment: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.DiscussionThread, thread_id) is None:
+        raise HTTPException(status_code=404, detail="Discussion thread not found.")
+
+    new_comment = models.ThreadComment(
+        thread_id=thread_id,
+        username=comment.username.strip(),
+        comment=comment.comment.strip(),
+    )
+    db.add(new_comment)
+    db.commit()
+    db.refresh(new_comment)
+    return new_comment
+
+# -------------------------
+# Opportunities
+# -------------------------
+@app.get("/opportunities", response_model=list[schemas.OpportunityResponse])
+def get_opportunities(db: Session = Depends(get_db)):
+    return db.scalars(
+        select(models.Opportunity).order_by(models.Opportunity.created_at.desc())
+    ).all()
+
+
+@app.post(
+    "/opportunities",
+    response_model=schemas.OpportunityResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_opportunity(
+    opportunity: schemas.OpportunityCreate,
+    db: Session = Depends(get_db),
+):
+    new_opportunity = models.Opportunity(
+        username=opportunity.username.strip(),
+        title=opportunity.title.strip(),
+        organization=opportunity.organization.strip(),
+        deadline=opportunity.deadline.strip() if opportunity.deadline else None,
+        link=opportunity.link.strip() if opportunity.link else None,
+        text=opportunity.text.strip(),
+    )
+    db.add(new_opportunity)
+    db.commit()
+    db.refresh(new_opportunity)
+    return new_opportunity
+
+
+@app.put(
+    "/opportunities/{opportunity_id}",
+    response_model=schemas.OpportunityResponse,
+)
+def update_opportunity(
+    opportunity_id: int,
+    changes: schemas.OpportunityUpdate,
+    db: Session = Depends(get_db),
+):
+    opportunity = db.get(models.Opportunity, opportunity_id)
+    if opportunity is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found.")
+
+    if changes.title is not None:
+        opportunity.title = changes.title.strip()
+    if changes.organization is not None:
+        opportunity.organization = changes.organization.strip()
+    if changes.deadline is not None:
+        opportunity.deadline = changes.deadline.strip() or None
+    if changes.link is not None:
+        opportunity.link = changes.link.strip() or None
+    if changes.text is not None:
+        opportunity.text = changes.text.strip()
+
+    db.commit()
+    db.refresh(opportunity)
+    return opportunity
+
+
+@app.delete("/opportunities/{opportunity_id}")
+def delete_opportunity(opportunity_id: int, db: Session = Depends(get_db)):
+    opportunity = db.get(models.Opportunity, opportunity_id)
+    if opportunity is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found.")
+
+    db.delete(opportunity)
+    db.commit()
+    return {"message": "Opportunity deleted."}
+
+
+@app.get(
+    "/opportunities/{opportunity_id}/comments",
+    response_model=list[schemas.CommentResponse],
+)
+def get_opportunity_comments(
+    opportunity_id: int,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Opportunity, opportunity_id) is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found.")
+
+    return db.scalars(
+        select(models.OpportunityComment)
+        .where(models.OpportunityComment.opportunity_id == opportunity_id)
+        .order_by(models.OpportunityComment.created_at.asc())
+    ).all()
+
+
+@app.post(
+    "/opportunities/{opportunity_id}/comments",
+    response_model=schemas.CommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_opportunity_comment(
+    opportunity_id: int,
+    comment: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+):
+    if db.get(models.Opportunity, opportunity_id) is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found.")
+
+    new_comment = models.OpportunityComment(
+        opportunity_id=opportunity_id,
+        username=comment.username.strip(),
+        comment=comment.comment.strip(),
+    )
+    db.add(new_comment)
+    db.commit()
+    db.refresh(new_comment)
+    return new_comment
